@@ -1,12 +1,23 @@
-import { Canvas, useFrame, useThree } from "@react-three/fiber";
+import { Canvas, ThreeEvent, useFrame, useThree } from "@react-three/fiber";
 import { Clone, ContactShadows, useAnimations, useGLTF } from "@react-three/drei";
 import CameraControlsImpl from "camera-controls";
 import { Suspense, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import type { MutableRefObject } from "react";
 import * as THREE from "three";
-import { BOARD_DEPTH, BOARD_LAYOUT, BOARD_WIDTH, getTilePosition, isPlayerCoord } from "../config/layout";
+import {
+  BOARD_DEPTH,
+  BOARD_LAYOUT,
+  BOARD_WIDTH,
+  ELEVATED_BUILD_COORDS,
+  FOX_PATH_POINTS,
+  LEVEL1_PATH_COORDS,
+  coordsEqual,
+  getTilePosition,
+  isDefenderCoord,
+  isPlayerCoord
+} from "../config/layout";
 import { usePerformanceStore } from "../state/performanceStore";
-import type { BoardCoord, SandboxUnit, UnitId } from "../types";
+import type { AttackEffect, BoardCoord, BoardPlacement, SandboxUnit, UnitId, UnitStats, WaveEnemy, WaveState } from "../types";
 
 CameraControlsImpl.install({ THREE });
 
@@ -27,12 +38,17 @@ const FOX_ISLAND_RADIUS_Z = BOARD_DEPTH / 2 + 4.8;
 const FOX_ISLAND_CENTER_Z = 0.42;
 const FOX_WALKABLE_EDGE_LIMIT = 0.9;
 const FOX_MIN_GROUND_Y = -0.12;
+const STATIC_SHADOW_REFRESH_FRAMES = 3;
+const MAIN_SHADOW_MAP_SIZE = 1024;
 const SHRINE_CORRIDOR_HALF_WIDTH = 4.2;
 const SHRINE_CORRIDOR_MIN_Z = -BOARD_DEPTH / 2 - 5.7;
 const SHRINE_CORRIDOR_MAX_Z = -BOARD_DEPTH / 2 - 1.0;
 const ENTRY_PATH_HALF_WIDTH = 1.22;
 const ENTRY_PATH_MIN_Z = BOARD_DEPTH / 2 + 0.7;
 const ENTRY_PATH_MAX_Z = BOARD_DEPTH / 2 + 5.6;
+const ATTACK_EFFECT_LIFETIME = 0.28;
+const ENEMY_ROAD_Y = 0.32;
+const ELEVATED_TILE_TOP_Y = 0.39;
 const ISLAND_MODEL_URL = new URL("../../glb/Meshy_AI_Verdant_Floating_Isla_0505075319_texture.glb", import.meta.url).href;
 const SIGNPOST_MODEL_URL = new URL("../../glb/Meshy_AI_Wooden_Signpost_with__0505095605_texture.glb", import.meta.url).href;
 const ARCANE_ALTAR_MODEL_URL = new URL("../../glb/Meshy_AI_Arcane_Altar_0505095808_texture.glb", import.meta.url).href;
@@ -40,6 +56,19 @@ const STONE_ARCH_MODEL_URL = new URL("../../glb/Meshy_AI_Verdant_Stone_Arch_0505
 const STONE_LANTERN_MODEL_URL = new URL("../../glb/Meshy_AI_Japanese_Stone_Lanter_0505095918_texture.glb", import.meta.url).href;
 const FACETED_STONE_PILE_MODEL_URL = new URL("../../glb/Meshy_AI_Faceted_Stone_Pile_0505102700_texture.glb", import.meta.url).href;
 const FOX_MODEL_URL = new URL("../../glb/Meshy_AI_Geode_Fox_quadruped_model_Animation_Walking_withSkin.glb", import.meta.url).href;
+const HERO_MODEL_URLS = {
+  "ser-caldor": new URL("../../glb/heroes/Meshy_AI_Radiant_Star_Knight_0505135652_texture.glb", import.meta.url).href,
+  tovin: new URL(
+    "../../glb/heroes/Meshy_AI_Azure_Vanguard_biped/Meshy_AI_Azure_Vanguard_biped_Character_output.glb",
+    import.meta.url
+  ).href,
+  nyra: new URL("../../glb/heroes/Meshy_AI_Lunar_Enchantress_0505135756_texture.glb", import.meta.url).href,
+  aurelia: new URL("../../glb/heroes/Meshy_AI_Goldenmane_Vanguard_0505135807_texture.glb", import.meta.url).href,
+  solene: new URL("../../glb/heroes/Meshy_AI_Stellar_Priestess_0505135714_texture.glb", import.meta.url).href,
+  "scribe-orin": new URL("../../glb/heroes/Meshy_AI_Celestial_Librarian_0505135728_texture.glb", import.meta.url).href,
+  maelis: new URL("../../glb/heroes/Meshy_AI_Celestial_Archivist_0505135820_texture.glb", import.meta.url).href,
+  kael: new URL("../../glb/heroes/Meshy_AI_Azure_Knight_of_Dawn_0505135744_texture.glb", import.meta.url).href
+} as const satisfies Record<UnitId, string>;
 const TREE_MODEL_URLS = {
   blossom: new URL("../../glb/Meshy_AI_Cherry_Blossom_Tree_0505071036_texture.glb", import.meta.url).href,
   layeredPine: new URL("../../glb/Meshy_AI_Layered_Paper_Pine_0505071115_texture.glb", import.meta.url).href,
@@ -52,10 +81,14 @@ interface CanvasSceneProps {
   units: SandboxUnit[];
   selectedUnitId: UnitId | null;
   draggingUnitId: UnitId | null;
+  wave: WaveState;
   hoveredBoardCoord: BoardCoord | null;
   cameraResetSignal: number;
   cameraMode: CameraMode;
+  cameraDragActive: boolean;
+  onWaveTick: (deltaSeconds: number) => void;
   onBoardHover: (coord: BoardCoord | null) => void;
+  onBoardTilePointerDown: (coord: BoardCoord) => void;
   onBoardUnitPointerDown: (unitId: UnitId) => void;
   onClearSelection: () => void;
 }
@@ -246,50 +279,255 @@ function BoardTile({
   );
 }
 
+function BoardTiles({
+  hoveredCoord,
+  onHover,
+  onClick
+}: {
+  hoveredCoord: BoardCoord | null;
+  onHover: (coord: BoardCoord | null) => void;
+  onClick: (coord: BoardCoord) => void;
+}) {
+  const rimRef = useRef<THREE.InstancedMesh>(null);
+  const topRef = useRef<THREE.InstancedMesh>(null);
+  const capRef = useRef<THREE.InstancedMesh>(null);
+  const matrixRef = useRef(new THREE.Matrix4());
+  const positionRef = useRef(new THREE.Vector3());
+  const quaternionRef = useRef(new THREE.Quaternion());
+  const scaleRef = useRef(new THREE.Vector3());
+  const tiles = useMemo(() => {
+    const entries: Array<{
+      coord: BoardCoord;
+      x: number;
+      z: number;
+      offsetX: number;
+      offsetZ: number;
+      scaleX: number;
+      scaleZ: number;
+      tiltY: number;
+    }> = [];
+
+    for (let row = 0; row < BOARD_LAYOUT.rows; row += 1) {
+      for (let col = 0; col < BOARD_LAYOUT.cols; col += 1) {
+        const coord = { col, row };
+        const [x, , z] = getTilePosition(coord);
+        const seed = col * 37 + row * 101;
+        entries.push({
+          coord,
+          x,
+          z,
+          offsetX: (seededNoise(seed + 2) - 0.5) * 0.06,
+          offsetZ: (seededNoise(seed + 6) - 0.5) * 0.06,
+          scaleX: 0.88 + seededNoise(seed + 12) * 0.05,
+          scaleZ: 0.88 + seededNoise(seed + 18) * 0.05,
+          tiltY: (seededNoise(seed + 28) - 0.5) * 0.05
+        });
+      }
+    }
+
+    return entries;
+  }, []);
+
+  useLayoutEffect(() => {
+    const matrix = matrixRef.current;
+    const position = positionRef.current;
+    const quaternion = quaternionRef.current;
+    const scale = scaleRef.current;
+    const rim = rimRef.current;
+    const top = topRef.current;
+    const cap = capRef.current;
+
+    if (!rim || !top || !cap) {
+      return;
+    }
+
+    tiles.forEach((tile, index) => {
+      quaternion.setFromEuler(new THREE.Euler(0, 0, 0));
+      matrix.compose(position.set(tile.x, -0.035, tile.z), quaternion, scale.set(1, 1, 1));
+      rim.setMatrixAt(index, matrix);
+
+      quaternion.setFromEuler(new THREE.Euler(0, tile.tiltY, 0));
+      matrix.compose(
+        position.set(tile.x + tile.offsetX, 0.022, tile.z + tile.offsetZ),
+        quaternion,
+        scale.set(tile.scaleX, 1, tile.scaleZ)
+      );
+      top.setMatrixAt(index, matrix);
+
+      quaternion.setFromEuler(new THREE.Euler(0, tile.tiltY * 0.55, 0));
+      matrix.compose(
+        position.set(tile.x + tile.offsetX * 0.45, 0.056, tile.z + tile.offsetZ * 0.4),
+        quaternion,
+        scale.set(tile.scaleX, 1, tile.scaleZ)
+      );
+      cap.setMatrixAt(index, matrix);
+    });
+
+    rim.instanceMatrix.needsUpdate = true;
+    top.instanceMatrix.needsUpdate = true;
+    cap.instanceMatrix.needsUpdate = true;
+  }, [tiles]);
+
+  function getCoordFromEvent(event: ThreeEvent<PointerEvent>) {
+    if (event.instanceId === undefined) {
+      return null;
+    }
+
+    return tiles[event.instanceId]?.coord ?? null;
+  }
+
+  function handlePointerMove(event: ThreeEvent<PointerEvent>) {
+    const coord = getCoordFromEvent(event);
+    if (!coord) {
+      return;
+    }
+
+    event.stopPropagation();
+    onHover(coord);
+  }
+
+  function handlePointerOut(event: ThreeEvent<PointerEvent>) {
+    event.stopPropagation();
+    onHover(null);
+  }
+
+  function handlePointerDown(event: ThreeEvent<PointerEvent>) {
+    if (event.button !== 0 || event.instanceId === undefined) {
+      return;
+    }
+
+    const coord = getCoordFromEvent(event);
+    if (!coord) {
+      return;
+    }
+
+    event.stopPropagation();
+    onClick(coord);
+  }
+
+  return (
+    <group>
+      <instancedMesh ref={rimRef} args={[undefined, undefined, tiles.length]} receiveShadow onPointerMove={handlePointerMove} onPointerOut={handlePointerOut} onPointerDown={handlePointerDown}>
+        <boxGeometry args={[BOARD_LAYOUT.tileSize - 0.02, 0.08, BOARD_LAYOUT.tileSize - 0.02]} />
+        <meshStandardMaterial color="#726a52" roughness={0.98} metalness={0.02} />
+      </instancedMesh>
+      <instancedMesh ref={topRef} args={[undefined, undefined, tiles.length]} receiveShadow castShadow onPointerMove={handlePointerMove} onPointerOut={handlePointerOut} onPointerDown={handlePointerDown}>
+        <boxGeometry args={[BOARD_LAYOUT.tileSize - 0.14, 0.055, BOARD_LAYOUT.tileSize - 0.14]} />
+        <meshStandardMaterial color="#a8a181" roughness={0.95} metalness={0.02} />
+      </instancedMesh>
+      <instancedMesh ref={capRef} args={[undefined, undefined, tiles.length]} receiveShadow castShadow onPointerMove={handlePointerMove} onPointerOut={handlePointerOut} onPointerDown={handlePointerDown}>
+        <boxGeometry args={[BOARD_LAYOUT.tileSize - 0.3, 0.007, BOARD_LAYOUT.tileSize - 0.3]} />
+        <meshStandardMaterial color="#b9b292" roughness={0.9} metalness={0.01} />
+      </instancedMesh>
+    </group>
+  );
+}
+
+interface BoardPieceUnit {
+  id: string;
+  name: string;
+  color: string;
+  accent: string;
+  stats: UnitStats;
+  placement: BoardPlacement;
+  targetPosition: [number, number] | null;
+}
+
 function UnitPiece({
   unit,
   selected,
   onPointerDown
 }: {
-  unit: SandboxUnit;
+  unit: BoardPieceUnit;
   selected: boolean;
-  onPointerDown: () => void;
+  onPointerDown?: () => void;
 }) {
-  if (unit.placement.kind !== "board") {
-    return null;
-  }
-
   const [x, , z] = getTilePosition(unit.placement.coord);
+  const isInteractive = Boolean(onPointerDown);
+  const heroModelUrl = HERO_MODEL_URLS[unit.id as UnitId];
+  const facingY = unit.targetPosition ? Math.atan2(unit.targetPosition[0] - x, unit.targetPosition[1] - z) : 0;
 
   return (
     <group
-      position={[x, 0.14, z]}
+      position={[x, ELEVATED_TILE_TOP_Y + 0.08, z]}
+      rotation={[0, facingY, 0]}
       onPointerDown={(event) => {
-        if (event.button !== 0) {
+        if (!onPointerDown || event.button !== 0) {
           return;
         }
         event.stopPropagation();
         onPointerDown();
       }}
     >
-      <mesh castShadow receiveShadow>
-        <cylinderGeometry args={[0.28, 0.34, 0.22, 24]} />
-        <meshStandardMaterial color={unit.color} roughness={0.42} metalness={0.25} />
-      </mesh>
-      <mesh position={[0, 0.28, 0]} castShadow>
-        <sphereGeometry args={[0.18, 24, 24]} />
-        <meshStandardMaterial color={unit.accent} roughness={0.3} metalness={0.16} />
-      </mesh>
-      <mesh position={[0, 0.16, 0.18]} castShadow rotation={[Math.PI / 2.8, 0, 0]}>
-        <coneGeometry args={[0.08, 0.28, 18]} />
-        <meshStandardMaterial color={unit.accent} roughness={0.22} metalness={0.24} />
-      </mesh>
+      {heroModelUrl ? (
+        <Suspense fallback={null}>
+          <HeroModel modelUrl={heroModelUrl} />
+        </Suspense>
+      ) : (
+        <>
+          <mesh castShadow receiveShadow>
+            <cylinderGeometry args={[0.28, 0.34, 0.22, 24]} />
+            <meshStandardMaterial color={unit.color} roughness={0.42} metalness={0.25} />
+          </mesh>
+          <mesh position={[0, 0.28, 0]} castShadow>
+            <sphereGeometry args={[0.18, 24, 24]} />
+            <meshStandardMaterial color={unit.accent} roughness={0.3} metalness={0.16} />
+          </mesh>
+          <mesh position={[0, 0.16, 0.18]} castShadow rotation={[Math.PI / 2.8, 0, 0]}>
+            <coneGeometry args={[0.08, 0.28, 18]} />
+            <meshStandardMaterial color={unit.accent} roughness={0.22} metalness={0.24} />
+          </mesh>
+          <mesh position={[0, 0.52, 0]} castShadow raycast={() => null}>
+            <boxGeometry args={[0.1 + unit.stats.damage * 0.015, 0.1, 0.1 + unit.stats.range * 0.018]} />
+            <meshStandardMaterial color={isInteractive ? unit.accent : "#fff0d8"} roughness={0.34} metalness={0.18} />
+          </mesh>
+        </>
+      )}
       {selected ? (
-        <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.08, 0]}>
-          <torusGeometry args={[0.42, 0.03, 12, 48]} />
-          <meshBasicMaterial color="#fff4c7" />
-        </mesh>
+        <>
+          <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.08, 0]}>
+            <torusGeometry args={[0.42, 0.03, 12, 48]} />
+            <meshBasicMaterial color="#fff4c7" />
+          </mesh>
+          <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.075, 0]} raycast={() => null}>
+            <ringGeometry args={[unit.stats.range - 0.035, unit.stats.range + 0.035, 96]} />
+            <meshBasicMaterial color={unit.accent} transparent opacity={0.34} depthWrite={false} />
+          </mesh>
+        </>
       ) : null}
+    </group>
+  );
+}
+
+function HeroModel({ modelUrl }: { modelUrl: string }) {
+  const gltf = useGLTF(modelUrl);
+
+  const preparedHero = useMemo(() => {
+    gltf.scene.traverse((object) => {
+      if (object instanceof THREE.Mesh) {
+        object.castShadow = true;
+        object.receiveShadow = true;
+      }
+    });
+
+    const bounds = new THREE.Box3().setFromObject(gltf.scene);
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    bounds.getSize(size);
+    bounds.getCenter(center);
+    const scale = size.y > 0 ? 1.18 / size.y : 1;
+
+    return {
+      scale,
+      offset: [-center.x * scale, -bounds.min.y * scale + 0.02, -center.z * scale] as [number, number, number]
+    };
+  }, [gltf.scene]);
+
+  return (
+    <group rotation={[0, Math.PI, 0]}>
+      <group position={preparedHero.offset} scale={preparedHero.scale} raycast={() => null}>
+        <Clone object={gltf.scene} />
+      </group>
     </group>
   );
 }
@@ -1063,7 +1301,7 @@ function FoxWanderer({ positionRef }: { positionRef: MutableRefObject<THREE.Vect
     bounds.getSize(size);
     bounds.getCenter(center);
     const maxAxis = Math.max(size.x, size.y, size.z);
-    const scale = maxAxis > 0 ? 1.44 / maxAxis : 1;
+    const scale = maxAxis > 0 ? 1.18 / maxAxis : 1;
     const lift = Math.max(0, -bounds.min.y) * scale;
 
     return {
@@ -1163,15 +1401,519 @@ function FoxWanderer({ positionRef }: { positionRef: MutableRefObject<THREE.Vect
   );
 }
 
+function WaveTicker({ onWaveTick }: { onWaveTick: (deltaSeconds: number) => void }) {
+  useFrame((_, delta) => {
+    onWaveTick(delta);
+  });
+
+  return null;
+}
+
+function ShrinePath() {
+  const material = useMemo(
+    () =>
+      new THREE.MeshStandardMaterial({
+        color: "#f0d98f",
+        emissive: "#896b2e",
+        emissiveIntensity: 0.16,
+        roughness: 0.82,
+        metalness: 0.02,
+        transparent: true,
+        opacity: 0.68
+      }),
+    []
+  );
+  const turnMaterial = useMemo(
+    () =>
+      new THREE.MeshStandardMaterial({
+        color: "#fff0a8",
+        emissive: "#e0a83b",
+        emissiveIntensity: 0.42,
+        roughness: 0.5,
+        metalness: 0.04
+      }),
+    []
+  );
+
+  return (
+    <group raycast={() => null}>
+      {FOX_PATH_POINTS.slice(1).map((point, index) => {
+        const previous = FOX_PATH_POINTS[index];
+        const dx = point[0] - previous[0];
+        const dz = point[1] - previous[1];
+        const length = Math.hypot(dx, dz);
+        const angle = Math.atan2(dx, dz);
+
+        return (
+          <mesh
+            key={`${previous[0]}:${previous[1]}-${point[0]}:${point[1]}`}
+            position={[previous[0] + dx / 2, -0.005, previous[1] + dz / 2]}
+            rotation={[0, angle, 0]}
+            receiveShadow
+          >
+            <boxGeometry args={[0.34, 0.018, length]} />
+            <primitive object={material} attach="material" />
+          </mesh>
+        );
+      })}
+      {FOX_PATH_POINTS.slice(1, -1).map((point, index) => (
+        <mesh key={`path-node-${index}`} position={[point[0], 0.105, point[1]]} rotation={[-Math.PI / 2, 0, 0]}>
+          <circleGeometry args={[index === 0 ? 0.2 : 0.13, 24]} />
+          <primitive object={turnMaterial} attach="material" />
+        </mesh>
+      ))}
+    </group>
+  );
+}
+
+function LevelOneLandmarks() {
+  const warningMaterial = useMemo(
+    () =>
+      new THREE.MeshBasicMaterial({
+        color: "#ffb15f",
+        transparent: true,
+        opacity: 0.56,
+        depthWrite: false
+      }),
+    []
+  );
+  const wardMaterial = useMemo(
+    () =>
+      new THREE.MeshBasicMaterial({
+        color: "#9ff3ff",
+        transparent: true,
+        opacity: 0.24,
+        depthWrite: false
+      }),
+    []
+  );
+
+  return (
+    <group raycast={() => null}>
+      <mesh position={[FOX_PATH_POINTS[0][0], 0.1, FOX_PATH_POINTS[0][1]]} rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[0.54, 0.64, 48]} />
+        <primitive object={warningMaterial} attach="material" />
+      </mesh>
+      <mesh position={[0, 0.11, -BOARD_DEPTH / 2 - 1.95]} rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[0.82, 0.9, 64]} />
+        <primitive object={wardMaterial} attach="material" />
+      </mesh>
+      <pointLight position={[FOX_PATH_POINTS[0][0], 1.4, FOX_PATH_POINTS[0][1]]} color="#ffb15f" intensity={0.8} distance={4.5} decay={2} />
+    </group>
+  );
+}
+
+function BoardElevationLayer({ hoveredCoord }: { hoveredCoord: BoardCoord | null }) {
+  const pathBaseMaterial = useMemo(
+    () =>
+      new THREE.MeshStandardMaterial({
+        color: "#876b45",
+        roughness: 0.94,
+        metalness: 0.01
+      }),
+    []
+  );
+  const pathCenterMaterial = useMemo(
+    () =>
+      new THREE.MeshStandardMaterial({
+        color: "#e4c36e",
+        emissive: "#8b6421",
+        emissiveIntensity: 0.18,
+        roughness: 0.82,
+        metalness: 0.02
+      }),
+    []
+  );
+  const platformWallMaterial = useMemo(
+    () =>
+      new THREE.MeshStandardMaterial({
+        color: "#8f8866",
+        roughness: 0.96,
+        metalness: 0.02
+      }),
+    []
+  );
+  const platformCapMaterial = useMemo(
+    () =>
+      new THREE.MeshStandardMaterial({
+        color: "#d4cfab",
+        roughness: 0.84,
+        metalness: 0.03
+      }),
+    []
+  );
+  const platformRuneMaterial = useMemo(
+    () =>
+      new THREE.MeshBasicMaterial({
+        color: "#fff2ae",
+        transparent: true,
+        opacity: 0.78,
+        depthWrite: false
+      }),
+    []
+  );
+  const hoverMaterial = useMemo(
+    () =>
+      new THREE.MeshBasicMaterial({
+        color: "#a8ffcb",
+        transparent: true,
+        opacity: 0.4,
+        depthWrite: false
+      }),
+    []
+  );
+
+  return (
+    <group raycast={() => null}>
+      {LEVEL1_PATH_COORDS.map((coord) => {
+        const [x, , z] = getTilePosition(coord);
+        return (
+          <group key={`road-${coord.col}-${coord.row}`} position={[x, 0, z]}>
+            <mesh position={[0, 0.035, 0]} receiveShadow>
+              <boxGeometry args={[BOARD_LAYOUT.tileSize + 0.08, 0.07, BOARD_LAYOUT.tileSize + 0.08]} />
+              <primitive object={pathBaseMaterial} attach="material" />
+            </mesh>
+            <mesh position={[0, 0.086, 0]} receiveShadow>
+              <boxGeometry args={[BOARD_LAYOUT.tileSize - 0.18, 0.025, BOARD_LAYOUT.tileSize - 0.18]} />
+              <primitive object={pathCenterMaterial} attach="material" />
+            </mesh>
+          </group>
+        );
+      })}
+      {ELEVATED_BUILD_COORDS.map((coord) => {
+        const [x, , z] = getTilePosition(coord);
+        const isHovered = hoveredCoord ? coordsEqual(hoveredCoord, coord) : false;
+        return (
+          <group key={`high-${coord.col}-${coord.row}`} position={[x, 0, z]}>
+            <mesh position={[0, 0.19, 0]} castShadow receiveShadow>
+              <boxGeometry args={[BOARD_LAYOUT.tileSize - 0.02, 0.32, BOARD_LAYOUT.tileSize - 0.02]} />
+              <primitive object={platformWallMaterial} attach="material" />
+            </mesh>
+            <mesh position={[0, ELEVATED_TILE_TOP_Y, 0]} castShadow receiveShadow>
+              <boxGeometry args={[BOARD_LAYOUT.tileSize - 0.18, 0.08, BOARD_LAYOUT.tileSize - 0.18]} />
+              <primitive object={platformCapMaterial} attach="material" />
+            </mesh>
+            <mesh position={[0, ELEVATED_TILE_TOP_Y + 0.048, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+              <circleGeometry args={[0.13, 24]} />
+              <primitive object={platformRuneMaterial} attach="material" />
+            </mesh>
+            {isHovered ? (
+              <mesh position={[0, ELEVATED_TILE_TOP_Y + 0.06, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+                <ringGeometry args={[0.43, 0.48, 36]} />
+                <primitive object={hoverMaterial} attach="material" />
+              </mesh>
+            ) : null}
+          </group>
+        );
+      })}
+    </group>
+  );
+}
+
+function BoardReadabilityLayer({ hoveredCoord }: { hoveredCoord: BoardCoord | null }) {
+  const pathMaterial = useMemo(
+    () =>
+      new THREE.MeshStandardMaterial({
+        color: "#d8bd72",
+        emissive: "#735c24",
+        emissiveIntensity: 0.08,
+        roughness: 0.86,
+        metalness: 0.02,
+        transparent: true,
+        opacity: 0.74
+      }),
+    []
+  );
+  const buildMaterial = useMemo(
+    () =>
+      new THREE.MeshBasicMaterial({
+        color: "#95e6be",
+        transparent: true,
+        opacity: 0.14,
+        depthWrite: false
+      }),
+    []
+  );
+  const hoverMaterial = useMemo(
+    () =>
+      new THREE.MeshBasicMaterial({
+        color: "#fff2a5",
+        transparent: true,
+        opacity: 0.32,
+        depthWrite: false
+      }),
+    []
+  );
+
+  const buildPockets = useMemo(() => {
+    const coords: BoardCoord[] = [];
+    for (let row = 0; row < BOARD_LAYOUT.rows; row += 1) {
+      for (let col = 0; col < BOARD_LAYOUT.cols; col += 1) {
+        const coord = { col, row };
+        if (isDefenderCoord(coord)) {
+          coords.push(coord);
+        }
+      }
+    }
+    return coords;
+  }, []);
+
+  return (
+    <group raycast={() => null}>
+      {LEVEL1_PATH_COORDS.map((coord) => {
+        const [x, , z] = getTilePosition(coord);
+        return (
+          <mesh key={`path-${coord.col}-${coord.row}`} position={[x, 0.071, z]} receiveShadow>
+            <boxGeometry args={[BOARD_LAYOUT.tileSize - 0.22, 0.018, BOARD_LAYOUT.tileSize - 0.22]} />
+            <primitive object={pathMaterial} attach="material" />
+          </mesh>
+        );
+      })}
+      {buildPockets.map((coord) => {
+        const [x, , z] = getTilePosition(coord);
+        return (
+          <mesh key={`build-${coord.col}-${coord.row}`} position={[x, 0.082, z]} rotation={[-Math.PI / 2, 0, 0]}>
+            <ringGeometry args={[0.35, 0.37, 24]} />
+            <primitive object={buildMaterial} attach="material" />
+          </mesh>
+        );
+      })}
+      {hoveredCoord ? (
+        <mesh
+          position={[getTilePosition(hoveredCoord)[0], 0.096, getTilePosition(hoveredCoord)[2]]}
+          rotation={[-Math.PI / 2, 0, 0]}
+        >
+          <ringGeometry args={[0.43, 0.46, 32]} />
+          <primitive object={hoverMaterial} attach="material" />
+        </mesh>
+      ) : null}
+    </group>
+  );
+}
+
+function RelicMarker({ wave }: { wave: WaveState }) {
+  const pulseRef = useRef<THREE.Group>(null);
+
+  useFrame(({ clock }) => {
+    if (!pulseRef.current) {
+      return;
+    }
+
+    const pulse = 1 + Math.sin(clock.elapsedTime * 3.4) * 0.05;
+    pulseRef.current.scale.setScalar(pulse);
+  });
+
+  const healthRatio = wave.relic.hp / wave.relic.maxHp;
+  const color = healthRatio <= 0.34 ? "#ff8b7d" : healthRatio <= 0.67 ? "#ffd16f" : "#92f2ff";
+
+  return (
+    <group position={[wave.relic.position[0], 0.42, wave.relic.position[1]]} raycast={() => null}>
+      <group ref={pulseRef}>
+        <mesh castShadow>
+          <octahedronGeometry args={[0.34, 0]} />
+          <meshStandardMaterial color={color} emissive={color} emissiveIntensity={0.72} roughness={0.24} metalness={0.08} />
+        </mesh>
+        <pointLight color={color} intensity={1.1} distance={4.2} decay={2} />
+      </group>
+      <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.34, 0]}>
+        <ringGeometry args={[0.48, 0.54, 48]} />
+        <meshBasicMaterial color={color} transparent opacity={0.44} depthWrite={false} />
+      </mesh>
+    </group>
+  );
+}
+
+function WolfGamePiece({ enemy }: { enemy: WaveEnemy }) {
+  const bodyColor = enemy.id.includes("2") ? "#6f5a4a" : enemy.id.includes("3") ? "#4f4b55" : "#5b4a42";
+  const accentColor = enemy.id.includes("2") ? "#f0c171" : enemy.id.includes("3") ? "#bda0ff" : "#ff9b77";
+
+  return (
+    <group position={[0, 0.68, 0]} scale={0.92} raycast={() => null}>
+      <mesh castShadow renderOrder={20} position={[0, 0.08, 0]} scale={[0.72, 0.34, 1.0]}>
+        <sphereGeometry args={[0.42, 18, 18]} />
+        <meshStandardMaterial color={bodyColor} emissive="#1f1512" emissiveIntensity={0.08} roughness={0.72} />
+      </mesh>
+      <mesh castShadow renderOrder={21} position={[0, 0.16, 0.48]} scale={[0.44, 0.36, 0.5]}>
+        <sphereGeometry args={[0.36, 18, 18]} />
+        <meshStandardMaterial color={bodyColor} emissive="#1f1512" emissiveIntensity={0.08} roughness={0.72} />
+      </mesh>
+      <mesh castShadow renderOrder={22} position={[0, 0.1, 0.82]} rotation={[Math.PI / 2, 0, 0]}>
+        <coneGeometry args={[0.18, 0.32, 18]} />
+        <meshStandardMaterial color="#e6d1ba" roughness={0.58} />
+      </mesh>
+      {[-0.16, 0.16].map((x) => (
+        <mesh key={`ear-${x}`} castShadow renderOrder={23} position={[x, 0.5, 0.47]} rotation={[0.2, 0, x < 0 ? 0.36 : -0.36]}>
+          <coneGeometry args={[0.1, 0.34, 4]} />
+          <meshStandardMaterial color={bodyColor} roughness={0.64} />
+        </mesh>
+      ))}
+      {[-0.28, 0.28].map((x) =>
+        [-0.34, 0.3].map((z) => (
+          <mesh key={`leg-${x}-${z}`} castShadow renderOrder={19} position={[x, -0.32, z]}>
+            <boxGeometry args={[0.13, 0.52, 0.13]} />
+            <meshStandardMaterial color="#3d332e" roughness={0.8} />
+          </mesh>
+        ))
+      )}
+      <mesh castShadow renderOrder={21} position={[0, 0.2, -0.72]} rotation={[-0.72, 0, 0]} scale={[0.16, 0.16, 0.68]}>
+        <coneGeometry args={[0.34, 0.9, 14]} />
+        <meshStandardMaterial color={bodyColor} roughness={0.68} />
+      </mesh>
+      <mesh renderOrder={30} position={[0, 0.68, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[0.5, 0.58, 48]} />
+        <meshBasicMaterial color={accentColor} transparent opacity={0.58} depthWrite={false} depthTest={false} />
+      </mesh>
+      <mesh renderOrder={31} position={[0, 0.92, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[0.3, 0.34, 32]} />
+        <meshBasicMaterial color={enemy.hp / enemy.maxHp < 0.45 ? "#ff5f55" : "#fff0a8"} transparent opacity={0.82} depthWrite={false} depthTest={false} />
+      </mesh>
+    </group>
+  );
+}
+
+function FoxEnemy({
+  enemy,
+  positionRef,
+  updateFollowTarget
+}: {
+  enemy: WaveEnemy;
+  positionRef: MutableRefObject<THREE.Vector3>;
+  updateFollowTarget: boolean;
+}) {
+  const islandSurface = useIslandSurfaceSampler();
+  const gltf = useGLTF(FOX_MODEL_URL);
+  const foxRef = useRef<THREE.Group>(null);
+  const modelRef = useRef<THREE.Group>(null);
+  const previousPositionRef = useRef(new THREE.Vector2(enemy.position[0], enemy.position[1]));
+  const { actions } = useAnimations(gltf.animations, modelRef);
+
+  const preparedFox = useMemo(() => {
+    gltf.scene.traverse((object) => {
+      if (object instanceof THREE.Mesh) {
+        object.castShadow = true;
+        object.receiveShadow = true;
+      }
+    });
+
+    const bounds = new THREE.Box3().setFromObject(gltf.scene);
+    const size = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    bounds.getSize(size);
+    bounds.getCenter(center);
+    const maxAxis = Math.max(size.x, size.y, size.z);
+    const scale = maxAxis > 0 ? 1.08 / maxAxis : 1;
+    const lift = Math.max(0, -bounds.min.y) * scale;
+
+    return {
+      scale,
+      lift,
+      centerOffset: [-center.x * scale, 0, -center.z * scale] as [number, number, number]
+    };
+  }, [gltf.scene]);
+
+  useEffect(() => {
+    const firstAction = Object.values(actions).find(Boolean);
+    if (!firstAction) {
+      return;
+    }
+
+    firstAction.reset();
+    firstAction.fadeIn(0.2);
+    firstAction.timeScale = enemy.alive ? 1.08 : 0.2;
+    firstAction.play();
+
+    return () => {
+      firstAction.fadeOut(0.2);
+    };
+  }, [actions, enemy.alive]);
+
+  useFrame(() => {
+    const fox = foxRef.current;
+    if (!fox) {
+      return;
+    }
+
+    const [x, z] = enemy.position;
+    const onBoard =
+      Math.abs(x) <= BOARD_WIDTH / 2 + BOARD_LAYOUT.tileSize &&
+      z >= -BOARD_DEPTH / 2 - 2.4 &&
+      z <= BOARD_DEPTH / 2 + 3.2;
+    const sampledGroundY = islandSurface.sampleTopHeight(x, z, islandSurface.topY);
+    const groundY = onBoard ? ENEMY_ROAD_Y : Math.max(sampledGroundY, FOX_MIN_GROUND_Y);
+    fox.position.set(x, groundY + FOX_GROUND_CLEARANCE, z);
+    if (updateFollowTarget) {
+      fox.getWorldPosition(positionRef.current);
+    }
+
+    const previous = previousPositionRef.current;
+    const dx = x - previous.x;
+    const dz = z - previous.y;
+    if (Math.hypot(dx, dz) > 0.001) {
+      fox.rotation.y = Math.atan2(dx, dz);
+      previous.set(x, z);
+    }
+  });
+
+  if (!enemy.alive) {
+    return null;
+  }
+
+  return (
+    <group ref={foxRef} raycast={() => null} visible={enemy.spawnDelay <= 0 || enemy.pathProgress > 0}>
+      <WolfGamePiece enemy={enemy} />
+      <group ref={modelRef} position={[preparedFox.centerOffset[0], 0.34, preparedFox.centerOffset[2]]} scale={preparedFox.scale}>
+        <group position={[0, preparedFox.lift / preparedFox.scale, 0]}>
+          <Clone object={gltf.scene} />
+        </group>
+      </group>
+      <mesh renderOrder={18} position={[0, 0.08, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+        <ringGeometry args={[0.4, 0.5, 36]} />
+        <meshBasicMaterial color="#ff623f" transparent opacity={0.72} depthWrite={false} depthTest={false} />
+      </mesh>
+    </group>
+  );
+}
+
+function AttackBeam({ effect }: { effect: AttackEffect }) {
+  const opacity = Math.max(0, 1 - effect.age / ATTACK_EFFECT_LIFETIME);
+  const dx = effect.to[0] - effect.from[0];
+  const dz = effect.to[1] - effect.from[1];
+  const length = Math.hypot(dx, dz);
+  const angle = Math.atan2(dx, dz);
+
+  return (
+    <mesh
+      position={[effect.from[0] + dx / 2, 0.72, effect.from[1] + dz / 2]}
+      rotation={[Math.PI / 2, 0, -angle]}
+      raycast={() => null}
+    >
+      <cylinderGeometry args={[0.025, 0.025, length, 10]} />
+      <meshBasicMaterial color="#fff0a8" transparent opacity={opacity} depthWrite={false} />
+    </mesh>
+  );
+}
+
+function AttackEffects({ effects }: { effects: AttackEffect[] }) {
+  return (
+    <group>
+      {effects.map((effect) => (
+        <AttackBeam key={effect.id} effect={effect} />
+      ))}
+    </group>
+  );
+}
+
 function CameraRig({
   resetSignal,
   dragging,
   cameraMode,
+  cameraDragActive,
   foxPositionRef
 }: {
   resetSignal: number;
   dragging: boolean;
   cameraMode: CameraMode;
+  cameraDragActive: boolean;
   foxPositionRef: MutableRefObject<THREE.Vector3>;
 }) {
   const camera = useThree((state) => state.camera as THREE.PerspectiveCamera);
@@ -1268,7 +2010,15 @@ function CameraRig({
     }
 
     controlsRef.current.enabled = !dragging && cameraMode === "free";
-  }, [cameraMode, dragging]);
+    controlsRef.current.mouseButtons.left = cameraDragActive
+      ? CameraControlsImpl.ACTION.TRUCK
+      : CameraControlsImpl.ACTION.NONE;
+    gl.domElement.style.cursor = cameraDragActive && cameraMode === "free" ? "grab" : "";
+
+    return () => {
+      gl.domElement.style.cursor = "";
+    };
+  }, [cameraDragActive, cameraMode, dragging, gl]);
 
   useEffect(() => {
     function isInteractiveElement(target: EventTarget | null): boolean {
@@ -1429,17 +2179,55 @@ function PerformanceSampler() {
   return null;
 }
 
+function StaticShadowController({ updateKey }: { updateKey: string }) {
+  const gl = useThree((state) => state.gl);
+  const refreshFramesRef = useRef(STATIC_SHADOW_REFRESH_FRAMES);
+
+  useEffect(() => {
+    gl.shadowMap.autoUpdate = true;
+    gl.shadowMap.needsUpdate = true;
+    refreshFramesRef.current = STATIC_SHADOW_REFRESH_FRAMES;
+
+    return () => {
+      gl.shadowMap.autoUpdate = true;
+    };
+  }, [gl, updateKey]);
+
+  useFrame(() => {
+    if (refreshFramesRef.current <= 0) {
+      return;
+    }
+
+    gl.shadowMap.needsUpdate = true;
+    refreshFramesRef.current -= 1;
+
+    if (refreshFramesRef.current === 0) {
+      gl.shadowMap.autoUpdate = false;
+    }
+  });
+
+  return null;
+}
+
 function BoardWorld(props: Omit<CanvasSceneProps, "onClearSelection"> & { onClearSelection: () => void }) {
   const foxPositionRef = useRef(new THREE.Vector3(...BOARD_LAYOUT.cameraTarget));
-  const boardTiles = useMemo(() => {
-    const tiles: BoardCoord[] = [];
-    for (let row = 0; row < BOARD_LAYOUT.rows; row += 1) {
-      for (let col = 0; col < BOARD_LAYOUT.cols; col += 1) {
-        tiles.push({ col, row });
-      }
-    }
-    return tiles;
-  }, []);
+  const followedFoxId =
+    props.wave.enemies
+      .filter((enemy) => enemy.alive && !enemy.reachedRelic && enemy.spawnDelay <= 0)
+      .sort((a, b) => b.pathProgress - a.pathProgress)[0]?.id ??
+    props.wave.enemies.find((enemy) => enemy.alive && !enemy.reachedRelic)?.id ??
+    null;
+  const shadowUpdateKey = useMemo(
+    () =>
+      props.units
+        .map((unit) =>
+          unit.placement.kind === "board"
+            ? `${unit.id}:board:${unit.placement.coord.col},${unit.placement.coord.row}`
+            : `${unit.id}:bench:${unit.placement.slot}`
+        )
+        .join("|"),
+    [props.units]
+  );
 
   return (
     <>
@@ -1448,9 +2236,12 @@ function BoardWorld(props: Omit<CanvasSceneProps, "onClearSelection"> & { onClea
         resetSignal={props.cameraResetSignal}
         dragging={Boolean(props.draggingUnitId)}
         cameraMode={props.cameraMode}
+        cameraDragActive={props.cameraDragActive}
         foxPositionRef={foxPositionRef}
       />
+      <WaveTicker onWaveTick={props.onWaveTick} />
       <PerformanceSampler />
+      <StaticShadowController updateKey={shadowUpdateKey} />
       <SkyDome />
       <CloudSea />
       <hemisphereLight args={["#f1f7ff", "#b7c79a", 1.4]} />
@@ -1460,8 +2251,8 @@ function BoardWorld(props: Omit<CanvasSceneProps, "onClearSelection"> & { onClea
         position={[-9.5, 13.5, 8.5]}
         intensity={2.65}
         color="#fff1d8"
-        shadow-mapSize-width={2048}
-        shadow-mapSize-height={2048}
+        shadow-mapSize-width={MAIN_SHADOW_MAP_SIZE}
+        shadow-mapSize-height={MAIN_SHADOW_MAP_SIZE}
         shadow-bias={-0.00008}
         shadow-normalBias={0.025}
         shadow-camera-near={1}
@@ -1480,6 +2271,9 @@ function BoardWorld(props: Omit<CanvasSceneProps, "onClearSelection"> & { onClea
         </Suspense>
         <EntryPath />
         <ArenaFrame />
+        <ShrinePath />
+        <BoardElevationLayer hoveredCoord={props.hoveredBoardCoord} />
+        <LevelOneLandmarks />
         <Suspense fallback={null}>
           <TreeScatter />
         </Suspense>
@@ -1499,34 +2293,57 @@ function BoardWorld(props: Omit<CanvasSceneProps, "onClearSelection"> & { onClea
           <FacetedStonePiles />
         </Suspense>
         <Suspense fallback={null}>
-          <FoxWanderer positionRef={foxPositionRef} />
-        </Suspense>
-        <PerimeterGrass />
-        <StoneScatter />
-        {boardTiles.map((coord) => (
-          <BoardTile
-            key={`${coord.col}-${coord.row}`}
-            coord={coord}
-            highlighted={
-              props.hoveredBoardCoord?.col === coord.col && props.hoveredBoardCoord?.row === coord.row
-            }
-            selected={false}
-            onHover={props.onBoardHover}
-            onClick={props.onClearSelection}
-          />
-        ))}
-        {props.units
-          .filter((unit) => unit.placement.kind === "board" && unit.id !== props.draggingUnitId)
-          .map((unit) => (
-            <UnitPiece
-              key={unit.id}
-              unit={unit}
-              selected={props.selectedUnitId === unit.id}
-              onPointerDown={() => props.onBoardUnitPointerDown(unit.id)}
+          {props.wave.enemies.map((enemy) => (
+            <FoxEnemy
+              key={enemy.id}
+              enemy={enemy}
+              positionRef={foxPositionRef}
+              updateFollowTarget={enemy.id === followedFoxId}
             />
           ))}
+        </Suspense>
+        <RelicMarker wave={props.wave} />
+        <PerimeterGrass />
+        <StoneScatter />
+        <BoardTiles
+          hoveredCoord={props.hoveredBoardCoord}
+          onHover={props.onBoardHover}
+          onClick={(coord) => {
+            props.onBoardTilePointerDown(coord);
+            if (!props.cameraDragActive) {
+              const selectedUnit = props.units.find((unit) => unit.id === props.selectedUnitId);
+              if (selectedUnit?.placement.kind !== "bench") {
+                props.onClearSelection();
+              }
+            }
+          }}
+        />
+        {props.units.map((unit) => {
+          if (unit.placement.kind !== "board" || unit.id === props.draggingUnitId) {
+            return null;
+          }
+
+          return (
+            <UnitPiece
+              key={unit.id}
+              unit={{ ...unit, placement: unit.placement }}
+              selected={props.selectedUnitId === unit.id}
+              onPointerDown={props.cameraDragActive ? undefined : () => props.onBoardUnitPointerDown(unit.id)}
+            />
+          );
+        })}
+        <AttackEffects effects={props.wave.attackEffects} />
       </group>
-      <ContactShadows position={[0, -0.22, 0.42]} opacity={0.24} scale={24} blur={3.4} far={16} color="#6d727a" />
+      <ContactShadows
+        position={[0, -0.22, 0.42]}
+        opacity={0.2}
+        scale={24}
+        blur={2.8}
+        far={16}
+        frames={1}
+        resolution={512}
+        color="#6d727a"
+      />
     </>
   );
 }
@@ -1554,7 +2371,7 @@ export function CanvasScene(props: CanvasSceneProps) {
     >
       <Canvas
         shadows
-        dpr={[1, 1.5]}
+        dpr={[1, 1.25]}
         camera={{ position: BOARD_LAYOUT.cameraPosition, fov: 38 }}
         onPointerMissed={() => {
           props.onClearSelection();
